@@ -1,0 +1,1 @@
+if something is hard link, I have to copy it regardless => find a way to know if a block is being used.
