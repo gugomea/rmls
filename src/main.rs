@@ -1,16 +1,16 @@
-use std::{fs::{metadata, File, Metadata, OpenOptions}, io::{self, Read, Seek, SeekFrom, Write}, time::Instant, usize};
+use std::{fs::{canonicalize, metadata, remove_dir_all, remove_file, File, Metadata, OpenOptions}, io::{self, Read, Seek, SeekFrom, Write}, path::Path, time::Instant, usize};
 use fiemap::{fiemap, FiemapExtent};
 use serde::{Deserialize, Serialize};
 
 const BLOCK_SIZE: u64 = 4096;
 const DB: &'static str = "DB.bin";
+const INPUT_MSG: &'static str = "Expected Input: <device> Option<input file>";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct ZombieFile {
     name: String,
     len: usize,
     extents: Vec<Extent>,
-    kind: Ztype,
 }
 
 impl ZombieFile {
@@ -19,60 +19,14 @@ impl ZombieFile {
             name,
             len: m.len() as usize,
             extents,
-            kind: Ztype::from(m),
         }
     }
 }
-
-#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
-enum Ztype {
-    File,
-    Dir,
-}
-
-impl From<Metadata> for Ztype {
-    fn from(value: Metadata) -> Self {
-        match value.is_file() {
-            true => Ztype::File,
-            false => Ztype::Dir,
-        }
-    }
-}
-
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
 struct Extent {
     start: u64,
     len: u64,
-}
-
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-struct DirEntry {
-    inode: u32,
-    rec_len: u16,
-    name_len: u8,
-    file_type: u8,
-    name: String,
-}
-
-impl DirEntry {
-    fn from_bytes(bytes: &[u8]) -> Self {
-        let name_len = bytes[6] as usize;
-        let name = String::from_utf8(bytes[8..name_len+8].to_vec())
-            .expect("Invalid UTF-8 string");
-
-        DirEntry {
-            inode: u32::from_le_bytes(<[u8; 4]>::try_from(&bytes[0..4]).unwrap()),
-            rec_len: u16::from_le_bytes(<[u8; 2]>::try_from(&bytes[4..6]).unwrap()),
-            name_len: bytes[6],
-            file_type: bytes[7],
-            name,
-        }
-    }
-    fn len(&self) -> usize {
-        self.rec_len as usize
-    }
 }
 
 impl From<FiemapExtent> for Extent {
@@ -145,8 +99,6 @@ fn persist_zombie_file<A: AsRef<str>, W: Write> (file: ZombieFile, device: A, mu
     };
 }
 
-const INPUT_MSG: &'static str = "Expected Input: <device> Option<input file>";
-
 fn get_input() -> (String, Option<String>) {
     let mut args = std::env::args();
     (
@@ -155,7 +107,7 @@ fn get_input() -> (String, Option<String>) {
     )
 }
 
-fn append_file_db(filename: String) {
+fn append_file_db<P: AsRef<Path>>(filename: P) {
     let fiemap: Vec<_> = fiemap(&filename)
         .expect("FIEMAP FAILED")
         .filter_map(|x| match x {
@@ -164,20 +116,35 @@ fn append_file_db(filename: String) {
         }).collect();
     let metadata = metadata(&filename)
         .expect("Error reading metadata from file");
-    //APPEND THE EXTENT INFORMATION INTO THE DB
-    let zombie = ZombieFile::new(filename, metadata, fiemap);
-    let mut db = OpenOptions::new()
-        .create(true).append(true)
-        .open(DB).expect("Error opening DB");
-    write_zombie_file(&mut db, zombie);
+    if metadata.is_file() {
+        // APPEND THE EXTENT INFORMATION INTO THE DB
+        println!("Adding file: {:?}", filename.as_ref());
+        let zombie = ZombieFile::new(filename.as_ref().to_str().unwrap().to_owned(), metadata, fiemap);
+        let mut db = OpenOptions::new()
+            .create(true).append(true)
+            .open(DB).expect("Error opening DB");
+        write_zombie_file(&mut db, zombie);
+        return;
+    }
+    for entry in std::fs::read_dir(filename).expect("path probably doesn't exist") {
+        let path = entry.unwrap().path();
+        append_file_db(path.to_str().unwrap().to_owned());
+    }
 }
 
 fn main() {
     let (device, filename) = get_input();
     if let Some(filename) = filename {
         let instant = Instant::now();
-        append_file_db(filename);
+        let m = metadata(&filename).unwrap();
+        let filename = canonicalize(filename).unwrap();
+        append_file_db(&filename);
         println!("Write file metadata to database: {:?}", instant.elapsed());
+        if m.is_file() {
+            remove_file(filename).expect("Couldn't remove file");
+        } else {
+            remove_dir_all(filename).expect("Couldn't remove directory");
+        }
         return;
     }
     //READ DATABASE
@@ -197,7 +164,11 @@ fn main() {
         zombie_files
     };
     println!("Read extent metadata from DB: {:?}", instant.elapsed());
-    println!("CHOOSE THE INDEX OF THIS ARRAY:\n{:#?}", db_data);
+    println!("CHOOSE THE INDEX OF THIS ARRAY:");
+    let show_file = |(i, d): (usize, &ZombieFile)| println!("{i}.\t{}", d.name);
+    db_data.iter()
+        .enumerate()
+        .for_each(show_file);
     let mut index = String::with_capacity(5);
     io::stdin().read_line(&mut index).expect("Error reading input");
     let Ok(index) = index.trim().parse() else {
@@ -209,39 +180,10 @@ fn main() {
     }
     let selected_zfile = db_data.swap_remove(index);
 
-    match selected_zfile.kind {
-        Ztype::File => {
-            let instant = Instant::now();
-            let new_file = File::create("new_file.bin").expect("Error creating output file");
-            {
-                persist_zombie_file(selected_zfile, &device, new_file);
-            }
-            println!("Persis zombie file to `new_file.bin`: {:?}", instant.elapsed());
-        }
-        Ztype::Dir => {
-            //Write directory entries to memory buffer. Small enough to load it fully in memory.
-            let instant = Instant::now();
-            let mut buff = vec![];
-            let writer = io::Cursor::new(&mut buff);
-            {
-                persist_zombie_file(selected_zfile, &device, writer);
-            }
-            println!("Read directory entries: {:?}", instant.elapsed());
-            let dirs = {
-                let mut i = 0;
-                let mut directories = vec![];
-                while i < buff.len() {
-                    while &buff[i..i+4] != &[0, 0, 0, 0] {
-                        let dir = DirEntry::from_bytes(&buff[i..]);
-                        i += dir.len();
-                        directories.push(dir);
-                    }
-                    i = i + 4 + 2 + 1 + 1 + 4;
-                }
-                directories
-            };
-            let mut nf = File::create("directories.txt").expect("Error opening DB");
-            let _ = nf.write_all(format!("{:#?}", dirs).as_bytes());
-        }
+    let instant = Instant::now();
+    let new_file = File::create("new_file.bin").expect("Error creating output file");
+    {
+        persist_zombie_file(selected_zfile, &device, new_file);
     }
+    println!("Persis zombie file to `new_file.bin`: {:?}", instant.elapsed());
 }
