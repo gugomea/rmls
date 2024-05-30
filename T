@@ -1,1 +1,8 @@
-if something is hard link, I have to copy it regardless => find a way to know if a block is being used.
+TUI:
+	1. Show tree in new window.
+	2. Preview of files/directoires to delete.
+	3. Confirm.
+
+
+
+traversing dir if open also count every file, so that offset is calculated right
