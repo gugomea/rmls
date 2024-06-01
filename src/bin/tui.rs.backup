@@ -1,0 +1,399 @@
+use std::env::args;
+use std::ffi::OsString;
+use std::fs::{self, metadata};
+use std::io::{self, stdout};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::cell::RefCell;
+use crossterm::event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEvent}, execute, terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen}, ExecutableCommand
+};
+use ratatui::prelude::*;
+use std::panic::{set_hook, take_hook};
+
+pub fn init_panic_hook() {
+    let _original_hook = take_hook();
+    set_hook(Box::new(move |panic_info| {
+        disable_raw_mode().unwrap();
+        stdout().execute(LeaveAlternateScreen).unwrap();
+        println!("{}", panic_info.to_string());
+    }));
+}
+
+fn main() -> io::Result<()> {
+    init_panic_hook();
+    enable_raw_mode()?;
+    execute!(stdout(), EnterAlternateScreen)?;
+    execute!(stdout(), 
+        Clear(ClearType::All),
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+
+    let dir_name = args().nth(1).unwrap();
+    let mut state = State::new(dir_name);
+    let mut current_height: u16 = terminal.size().unwrap().height - 2;
+    loop {
+        handle_events(&mut state, current_height)?;
+        if state.quit {
+            break;
+        }
+        let entries = state.root.iter(false);
+        current_height = u16::min(entries.len() as u16, terminal.size().unwrap().height - 2);
+        terminal.draw(|frame| {
+            let screen = frame.size();
+            //frame.render_widget(Block::bordered(), screen);
+            let info = format!("Entries: {}\nCurrent Height: {}\nY: {}\nOffset: {}\nCurrent:{:?}", entries.len(), current_height, state.y, state.skip, state.id);
+            frame.render_widget(Text::raw(info), Rect { x: screen.width / 2, y: screen.height / 2, width: screen.width / 2, height: screen.height / 2 });
+            for (i, dir) in entries.iter().skip(state.skip).take(current_height as usize).enumerate() {
+                let dir = dir.borrow();
+                let i = i as u16 + 1;
+                let line_area = Rect::new(1, i, screen.width - 2, 1);
+                let padding = " ".repeat(dir.id.len());
+                let arrow = match (dir.is_file, dir.open) {
+                    (false, true) => "\u{2B9F}",
+                    (false, false) => "\u{2B9E}",
+                    _ => " ",
+                };
+                let name = dir.name.to_str().unwrap_or("Non UTF-8 name");
+                let mut text = Text::raw(format!("{padding}{arrow} {name}"));
+                let current = i == u16::min(state.y as u16, screen.height-2);
+                if dir.deleted {
+                    text = Text::raw(format!("{padding}{arrow} {name}"))
+                        .fg(Color::Black)
+                        .bg(Color::Yellow);
+                }
+                if current {
+                    text = Text::raw(format!("{padding}{arrow} {name}"))
+                        .fg(Color::Black)
+                        .bg(Color::Gray);
+                }
+                frame.render_widget(text, line_area);
+            }
+        })?;
+    }
+    disable_raw_mode()?;
+    execute!(stdout(), PopKeyboardEnhancementFlags)?;
+    stdout().execute(LeaveAlternateScreen)?;
+    state.root.iter(true)
+        .iter().filter(|x| x.borrow().deleted)
+        .for_each(|entry| println!("{:?}", Path::new(&entry.borrow().path)
+                                                .join(&entry.borrow().name)));
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct State {
+    y: u16,
+    skip: usize,
+    quit: bool,
+    enter: bool,
+    root: DirTree,
+    id: Vec<usize>,
+    deletions: Vec<Vec<usize>>,
+}
+
+
+//.                        [0]           (not visible)
+// ├── Cargo.lock          [0, 0]         => Node { id: [0, 0], name: "Cargo.lock", open: flase, cached_children: None }
+// ├── Cargo.toml          [0, 1]
+// ├── files2.sh           [0, 2]
+// ├── logs.txt            [0, 3]
+// ├── src                 [0, 4]         => Node { id: [0, 4], name: "Cargo.lock", open: true, cached_children: Some([..]) }
+// │   ├── bin             [0, 4, 0]
+// │   │   ├── recover.rs  [0, 4, 0, 1]
+// │   │   ├── rm.rs       [0, 4, 0, 1]
+// │   │   └── tui.rs      [0, 4, 0, 3]
+// │   └── lib.rs          [0, 4, 1]
+// ├── symbolic_links      [0, 5]
+// │   ├── hard_link       [0, 5, 0]
+// │   ├── soflink_to      [0, 5, 1]
+// │   ├── soft_link       [0, 5, 2]
+// │   └── source_file     [0, 5, 3]
+// └── T                   [0, 6]
+type Entry = Rc<RefCell<Node>>;
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Default)]
+struct Node {
+    id: Vec<usize>, // there won't be two equals id, so we can derive Ord.
+    name: OsString,
+    open: bool,
+    path: PathBuf,
+    is_file: bool,
+    deleted: bool,
+    cached_children: Option<Vec<Entry>>, //could use jus tempty vec as no cache or no children but since there will be
+                                         //more files than directires we save the extra allocation
+}
+
+impl Node {
+    fn attach(&mut self) {
+        self.deleted = false;
+        if self.is_file {
+            return;
+        }
+        if let Some(ref children) = self.cached_children {
+            for ch in children {
+                ch.borrow_mut().attach();
+            }
+        }
+    }
+
+    fn detach(&mut self) {
+        self.deleted = true;
+        if self.is_file {
+            return;
+        }
+        if let Some(ref children) = self.cached_children {
+            for ch in children {
+                ch.borrow_mut().detach();
+            }
+        }
+    }
+
+    fn request_children(&mut self) {
+        if self.cached_children.is_none() {
+            let mut children = vec![];
+            let new_path = Path::new(&self.path).join(&self.name);
+            let entries = fs::read_dir(&new_path)
+                .expect("Error opening dir")
+                .into_iter();
+            for (i, entry) in entries.enumerate() {
+                let path = entry.unwrap().path();
+                let is_file = path.is_file();
+                let name = path.file_name()
+                    .expect("Invalid OSstr")
+                    .to_owned();
+                let id = [self.id.clone(), vec![i]].concat();
+                children.push(Rc::new(RefCell::new(Node {
+                    id, name, deleted: false,
+                    open: false, is_file,
+                    cached_children: None,
+                    path: new_path.clone()
+                })));
+            }
+            self.cached_children = Some(children);
+        }
+    }
+
+    fn iter(&self, full: bool) -> Vec<Entry> {
+        let mut acc = vec![];
+        if let Some(ref cached_children) = self.cached_children {
+            for ch in cached_children {
+                let inner = ch.borrow();
+                let visible = !inner.deleted;
+                if visible {
+                    acc.push(ch.clone());
+                }
+                let open = inner.open && visible;
+                if (open && !full) || full {
+                    acc.append(&mut inner.iter(full));
+                }
+            }
+            return acc;
+        }
+        return acc;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Default)]
+struct DirTree {
+    root: Entry,
+}
+
+impl DirTree {
+    fn previous(&self, mut id: Vec<usize>) -> Option<Entry> {
+        match id.pop() {
+            Some(last) if last > 0 => id.push(last-1),
+            Some(_zero) => return self.get(&id), //has to be the root of this direcory
+            None => return None,
+        }
+
+        let Some(mut current) = self.get(&id) else { 
+            return None
+        };
+
+        if !current.borrow().open {
+            return Some(current);
+        }
+
+        loop {
+            let last = match &current.borrow().cached_children {
+                Some(ch) if current.borrow().open => ch.last().unwrap().clone(), // array can't be empty
+                _ => break,
+            };
+            current = last;
+        }
+        return Some(current);
+    }
+
+    fn next(&self, mut id: Vec<usize>) -> Option<Entry> {
+        let Some(current) = self.get(&id) else { 
+            return None
+        };
+
+        //if open, then it has at least one file
+        if current.borrow().open {
+            id.push(0);
+            return self.get(&id);
+        }
+
+        //try to go down.
+        *id.last_mut().unwrap() += 1;
+        if let Some(next) = self.get(&id) {
+            return Some(next);
+        }
+        *id.last_mut().unwrap() -= 1;
+
+        //we have to go up, to the closes one, so we go in reverse order
+        for i in (1..id.len()).rev() {
+            let mut upper_id = id[..i].to_vec();
+            *upper_id.last_mut().unwrap() += 1;
+            if let Some(upper) = self.get(&upper_id) {
+                return Some(upper);
+            }
+        }
+        return None;
+    }
+
+    fn traverse(&self, id: &[usize], visible_nodes: bool) -> Option<Entry> {
+        let mut current_entry = None;
+        let mut current_root = self.root.clone();
+        for &i in &id[1..] {
+            let ith_children = {
+                match current_root.borrow().cached_children.as_ref() {
+                    Some(children) if i < children.len() => children[i].clone(),
+                    Some(_) | None => return None, // out of bounds or None
+                }
+            };
+            if visible_nodes && ith_children.borrow().deleted {
+                return None;
+            }
+            current_root = ith_children.clone();
+            current_entry = Some(ith_children.clone());
+        }
+        return current_entry;
+    }
+
+    fn get(&self, id: &[usize]) -> Option<Entry> {
+        return self.traverse(id, true);
+    }
+
+    fn iter(&self, full: bool) -> Vec<Entry> {
+        let mut acc = vec![]; // vec![self.root.clone()];
+        if let Some(ref cached_children) = self.root.borrow().cached_children {
+            for ch in cached_children {
+                let inner = ch.borrow();
+                let visible = !inner.deleted;
+                if visible {
+                    acc.push(ch.clone());
+                }
+                let open = inner.open && visible;
+                if (open && !full) || full {
+                    acc.append(&mut inner.iter(full));
+                }
+            }
+            return acc;
+        }
+        return acc;
+    }
+
+}
+
+impl State {
+    fn new(name: String) -> Self {
+        let name = name.into();
+        let _mt = metadata(&name).expect("File doen't exist");
+        let root = Rc::new(RefCell::new(Node {
+            id: vec![0],
+            name, open: false,
+            is_file: false,
+            deleted: false,
+            cached_children: None,
+            path: "".into(),
+        }));
+        root.borrow_mut().request_children();
+        let root = DirTree { root };
+        Self {
+            skip: 0, y: 1,
+            quit: false,
+            enter: false,
+            root, id: vec![0, 0],
+            deletions: vec![],
+        }
+    }
+}
+
+fn go_up(app: &mut State) {
+    //we are at the top, but we have skipped(at least one), so we show the skipped at the top
+    if app.y == 1 && app.skip > 0{
+        app.skip -= 1;
+    } else if app.y != 1 { // just go up.
+        app.y -= 1;
+    }
+    let next = app.root.previous(app.id.clone());
+    if let Some(next) = next {
+        app.id = next.borrow().id.clone();
+    }
+}
+
+fn go_down(app: &mut State, height: u16) {
+    let next = app.root.next(app.id.clone());
+    if let Some(next) = next {
+        let next = next.borrow().id.clone();
+        app.id = next;
+        match app.y < height {
+            true => app.y += 1,     // we are inside the window, just go down.
+            false => app.skip += 1, // we are not, so we skip the upper files(to show the one behind us)
+        }
+    }
+}
+
+fn handle_events(app: &mut State, height: u16) -> io::Result<()> {
+    if event::poll(std::time::Duration::from_millis(50))? {
+        match event::read()? {
+            #[allow(unused_variables)]
+            Event::Key(KeyEvent { code, modifiers, kind, state }) => {
+                match code {
+                    KeyCode::Char('j') => go_down(app, height),
+                    KeyCode::Char('k') => go_up(app),
+                    KeyCode::Char('q') => app.quit = true,
+                    KeyCode::Char('u') => {
+                        if let Some(deleted) = app.deletions.pop() {
+                            let file = app.root.traverse(&deleted, false).unwrap(); // we know it 100% exists.
+                            file.borrow_mut().attach();
+                        } else {
+                            //print that it is last deletion at bottom or pop up!
+                        }
+                    }
+                    KeyCode::Char('v') => { // if modifiers.contains(KeyModifiers::CONTROL) => {
+                        let Some(current) = app.root.get(&app.id) else { panic!("panik borrando") };
+                        if !current.borrow().deleted { // CHECK FOR REPEATED
+                            app.deletions.push(current.borrow().id.clone());
+                            if let Some(next) = app.root.next(app.id.clone()) {
+                                app.id = next.borrow().id.clone(); // TOOD: CHECK
+                            } else if let Some(prev) = app.root.previous(app.id.clone()) {
+                                go_up(app);
+                            } else {
+                                //panic!("HAS BORRADO TODO MACHO");
+                            }
+                            current.borrow_mut().detach();
+                        }
+                    }
+                    KeyCode::Enter => {
+                        app.enter = !app.enter;
+                        let Some(current) = app.root.get(&app.id) else { panic!("panik entereando") };
+                        if !current.borrow().is_file {
+                            current.borrow_mut().open ^= true; // so that assignment is not that long :)
+                            current.borrow_mut().request_children();
+                        }
+                    }
+                    _ => {} // avoiding rest of characters
+                }
+            }
+            Event::Mouse(_) => {}
+            _ => {} // avoiding rest of events...
+        }
+    }
+    Ok(())
+}
