@@ -17,7 +17,7 @@ pub fn init_panic_hook() {
     let _original_hook = take_hook();
     set_hook(Box::new(move |panic_info| {
         disable_raw_mode().unwrap();
-        //stdout().execute(LeaveAlternateScreen).unwrap();
+        stdout().execute(LeaveAlternateScreen).unwrap();
         println!("{}", panic_info.to_string());
     }));
 }
@@ -41,18 +41,10 @@ fn main() -> io::Result<()> {
             break;
         }
         let entries: Vec<Entry> = DirEntry::entries(&state.root, false);
-        current_height = u16::min(entries.len() as u16, terminal.size().unwrap().height - 2);
         terminal.draw(|frame| {
             let screen = frame.size();
+            current_height = u16::min(entries.len() as u16, screen.height - 2);
             //frame.render_widget(Block::bordered(), screen);
-            let info = format!("Entries: {}\nCurrent Height: {}\nY: {}\nOffset: {}\nCurrent:{:?}\nDeleted:{:?}", 
-                entries.len(),
-                current_height,
-                state.y,
-                state.skip,
-                state.id,
-                state.deletions);
-            frame.render_widget(Paragraph::new(info).block(Block::bordered().border_type(BorderType::Rounded)), Rect { x: screen.width / 2, y: screen.height / 2, width: screen.width / 2, height: screen.height / 2 });
             for (i, dir) in entries.iter().skip(state.skip).take(current_height as usize).enumerate() {
                 let dir = dir.borrow();
                 let i = i as u16 + 1;
@@ -66,11 +58,6 @@ fn main() -> io::Result<()> {
                 let name = dir.name.to_str().unwrap_or("Non UTF-8 name");
                 let mut text = Text::raw(format!("{padding}{arrow} {name}"));
                 let current = i == u16::min(state.y as u16, screen.height-2);
-                if dir.deleted {
-                    text = Text::raw(format!("{padding}{arrow} {name}"))
-                        .fg(Color::Black)
-                        .bg(Color::Yellow);
-                }
                 if current {
                     text = Text::raw(format!("{padding}{arrow} {name}"))
                         .fg(Color::Black)
@@ -78,6 +65,16 @@ fn main() -> io::Result<()> {
                 }
                 frame.render_widget(text, line_area);
             }
+            let info_area = Rect { x: screen.width / 2, y: screen.height / 2, width: screen.width / 2, height: screen.height / 2 };
+            let info = format!("Entries: {}\nCurrent Height: {}\nY: {}\nOffset: {}\nCurrent:{:?}\nDeleted:{:?}", 
+                entries.len(),
+                current_height,
+                state.y,
+                state.skip,
+                state.id,
+                state.deletions);
+            frame.render_widget(ratatui::widgets::Clear, info_area);
+            frame.render_widget(Paragraph::new(info).block(Block::bordered().border_type(BorderType::Rounded)), info_area);
         })?;
     }
     disable_raw_mode()?;
@@ -100,7 +97,7 @@ struct State {
     enter: bool,
     root: Entry,
     id: Vec<usize>,
-    deletions: Vec<Vec<usize>>,
+    deletions: Vec<(Vec<usize>, u16, usize)>,//(id, skip, y)
 }
 
 
@@ -142,11 +139,28 @@ trait DirEntry {
     fn request_children(root: &Self);
     fn entries(root: &Self, all_nodes: bool) -> Vec<Entry>;
     fn get(root: &Self, id: &[usize]) -> Option<Entry>;
+    fn go(root: &Self, id: &[usize]) -> Option<()>;//just return option so I can do '?', could have returned boolean
     fn detach(root: &Self);
     fn attach(root: &Self);
 }
 
 impl DirEntry for Entry {
+    //go to certain id. Open directories if needed.
+    //If find deleted directory, then return None;
+    fn go(root: &Self, id: &[usize]) -> Option<()> {
+        let mut current = root.clone();
+        for &i in &id[1..] {
+            let curr = current
+                .borrow().cached_children
+                .as_ref()?[i].clone();
+            current = curr;
+            current.borrow_mut().open = true;
+            if current.borrow().deleted {
+                return None;
+            }
+        }
+        return Some(());
+    }
     fn detach(root: &Self) {
         root.borrow_mut().deleted = true;
         if root.borrow().is_file {
@@ -212,84 +226,61 @@ impl DirEntry for Entry {
     }
 
     fn next(root: &Entry) -> Option<Entry> {
-        //try to go to the first 
+        //scan the children of parent from left to right
         let mut skip = 0;
+        //our parent is the current node, so we skip 0 childs (since we skip the ones on our left, the first one skips 0)
         let mut parent = root.clone();
         loop {
-            {
+            parent = {
                 let parent_ = parent.borrow();
                 let children = parent_.cached_children.as_ref();
                 if let Some(children) = children {
+                    //scan children from left to right, skipping the siblings before us
                     let child = children.iter()
                         .skip(skip)
                         .find(|x| !x.borrow().deleted)
                         .cloned();
+                    //we could only reach the child if the parent was open
                     if child.is_some() && parent_.open {
-                        //println!("\n\nnext: {:?}", child.as_ref().unwrap().borrow().id);
                         return child;
                     }
                 }
-            }
-            {
-                let id = &parent.borrow().id;
-                match id.last() {
-                    Some(n) => skip = *n + 1,
-                    None => break,
-                }
-            }
-            parent = {
-                let tmp_parent = parent.borrow();
-                match tmp_parent.parent.as_ref() {
-                    Some(p) => p.upgrade().unwrap(),
-                    None => break,
-                }
+                let id = &parent_.id;
+                // the index, represents the position of the child, so + 1 since we want to start to our right
+                skip = id.last()? + 1;
+                //go up one level, and try again
+                parent_.parent.as_ref()?//if no parent, we can't keep searching
+                    .upgrade().unwrap()
             };
         }
-        return None;
     }
 
     fn previous(root: &Entry) -> Option<Entry> {
         //go to the closest on the left, once there go full down right
         //try to go to the first 
-        let id = *root.borrow().id.last().unwrap();
-        let mut take = id;
-        let Some(parent) = root.borrow().parent .clone() else { 
-            return None
-        };
+        let mut take = *root.borrow().id.last()?;
+        let parent = root.borrow().parent.clone()?;
         let mut parent = parent.upgrade().unwrap();
         let mut new_root = loop {
-            {
-                let parent_ = parent.borrow();
-                let children = parent_.cached_children.as_ref();
-                if let Some(children) = children {
-                    let child = children.iter()
-                        .take(take).rev()
-                        .find(|x| !x.borrow().deleted)
-                        .cloned();
-                    //we found a child to the left of ourselves.
-                    if child.is_some() {
-                        //println!("PREVIOUS: {:?}", child);
-                        break child.unwrap();
-                    }
-                    //we didn't but if the parent is valid, we return it
-                    if !parent_.deleted && parent_.id != &[0] {
-                        return Some(parent.clone());
-                    }
-                }
-            }
-            {
-                let id = &parent.borrow().id;
-                match id.last() {
-                    Some(n) => take = *n,
-                    None => return None,
-                }
-            }
             parent = {
-                let tmp_parent = parent.borrow();
-                match tmp_parent.parent.as_ref() {
-                    Some(p) => p.upgrade().unwrap(),
-                    None => return None,
+                let parent_ = parent.borrow();
+                let child = parent_.cached_children.as_ref()?
+                    .iter()
+                    .take(take).rev()
+                    .find(|x| !x.borrow().deleted)
+                    .cloned();
+                //we found a child to the left of ourselves.
+                if child.is_some() {
+                    //println!("PREVIOUS: {:?}", child);
+                    break child.unwrap();
                 }
+                //we didn't but if the parent is valid, we return it
+                if !parent_.deleted && parent_.id != &[0] {
+                    return Some(parent.clone());
+                }
+                take = *parent_.id.last()?;
+                parent_.parent.as_ref()?
+                    .upgrade().unwrap()
             };
         };
 
@@ -406,19 +397,17 @@ fn handle_events(app: &mut State, height: u16) -> io::Result<()> {
                     KeyCode::Char('k') => go_up(app),
                     KeyCode::Char('q') => app.quit = true,
                     KeyCode::Char('u') => {
-                        if let Some(deleted) = app.deletions.pop() {
-                            let deleted = DirEntry::get(&app.root, &deleted).unwrap();
-                            DirEntry::attach(&deleted);
-                            ////check if the file goes before of after us, to move up or down
-                            //let file_id = &file.borrow().id;
-                            //if file_id < &app.id {
-                            //    match app.y < height {
-                            //        true => app.y += 1,     // we are inside the window, just go down.
-                            //        false => app.skip += 1, // we are not, so we skip the upper files(to show the one behind us)
-                            //    }
-                            //} else {
-                            //    go_up(app);
-                            //}
+                        //If you delete files and then directory, when restoring you will have the
+                        //full directory.Maybe keep poping while the id's are already attached.
+                        if let Some((deleted, y, skip)) = app.deletions.pop() {
+                            let del= DirEntry::get(&app.root, &deleted).unwrap();//We know its in the tree
+                            DirEntry::attach(&del);
+                            if DirEntry::go(&app.root, &deleted).is_none() {//impossible
+                                unreachable!("FOUND DELETED DIRECTORY WHILE TRAVERSING");
+                            }
+                            app.id = deleted;
+                            app.skip = skip;
+                            app.y = y;
                         } else {
                             //print that it is last deletion at bottom or pop up!
                         }
@@ -427,17 +416,12 @@ fn handle_events(app: &mut State, height: u16) -> io::Result<()> {
                         let Some(current) = DirEntry::get(&app.root, &app.id) else {
                             panic!("ERROR GETTING ID: {:?}", app.id)
                         };
-                         // CHECK FOR REPEATED
-                        if current.borrow().deleted {
-                            panic!("DELETED");
-                            //return Ok(());
-                        }
-                        app.deletions.push(current.borrow().id.clone());
+                        app.deletions.push((current.borrow().id.clone(), app.y, app.skip));
                         DirEntry::detach(&current);
                         if let Some(next) = DirEntry::next(&current) {
                             app.id = next.borrow().id.clone();
                         } else if let Some(prev) = DirEntry::previous(&current) {
-                            app.id = prev.borrow().id.clone();
+                            go_up(app);// we have to move.
                         } else {
                             panic!("ALL FILES DELETED");
                         }
