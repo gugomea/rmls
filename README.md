@@ -13,7 +13,7 @@
 
 ## Demo
 
-![This is an alt text.](https://github.com/gugomea/rmls/demo.gif)
+![This is an alt text.](https://github.com/gugomea/rmls/blob/main/demo.gif)
 
 
 ## Commands
