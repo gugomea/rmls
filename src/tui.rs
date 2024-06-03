@@ -1,4 +1,3 @@
-use std::env::args;
 use std::ffi::OsString;
 use std::fs::metadata;
 use std::io::{self, stdout};
@@ -10,19 +9,18 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEvent}, execute, terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen}, ExecutableCommand
 };
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, BorderType, Paragraph};
 use std::panic::{set_hook, take_hook};
 
 pub fn init_panic_hook() {
     let _original_hook = take_hook();
     set_hook(Box::new(move |panic_info| {
         disable_raw_mode().unwrap();
-        //stdout().execute(LeaveAlternateScreen).unwrap();
+        stdout().execute(LeaveAlternateScreen).unwrap();
         println!("{}", panic_info.to_string());
     }));
 }
 
-fn main() -> io::Result<()> {
+pub fn tui(dir_name: String) -> io::Result<Vec<PathBuf>> {
     init_panic_hook();
     enable_raw_mode()?;
     execute!(stdout(), EnterAlternateScreen)?;
@@ -31,8 +29,6 @@ fn main() -> io::Result<()> {
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     )?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
-
-    let dir_name = args().nth(1).unwrap();
     let mut state = State::new(dir_name);
     let mut current_height: u16 = terminal.size().unwrap().height - 2;
     loop {
@@ -40,7 +36,7 @@ fn main() -> io::Result<()> {
         if state.quit {
             break;
         }
-        let entries: Vec<Entry> = DirEntry::entries(&state.root, false);
+        let entries: Vec<Entry> = DirEntry::entries(&state.root, EntryState::Visible);
         terminal.draw(|frame| {
             let screen = frame.size();
             current_height = u16::min(entries.len() as u16, screen.height - 2);
@@ -63,8 +59,6 @@ fn main() -> io::Result<()> {
                         .fg(Color::Black)
                         .bg(Color::Gray);
                 }
-
-                ////
                 if let Some((ref id_selected, _, _)) = state.selecting {
                     let id = &state.id;
                     //selected - current - state.id   || state.id - current - selected
@@ -75,34 +69,31 @@ fn main() -> io::Result<()> {
                     }
                     
                 }
-                ////
-
                 frame.render_widget(text, line_area);
             }
-            let info_area = Rect { x: screen.width / 2, y: screen.height / 2, width: screen.width / 2, height: screen.height / 2 };
-            let info = format!("Entries: {}\nCurrent Height: {}\nY: {}\nOffset: {}\nCurrent:{:?} - {:?}\nDeleted:{:?}\nSelecting:{:?}", 
-                entries.len(),
-                current_height,
-                state.y,
-                state.skip,
-                state.id,
-                DirEntry::get(&state.root, &state.id).unwrap().borrow().name,
-                state.deletions,
-                state.selecting,
-                );
-            frame.render_widget(ratatui::widgets::Clear, info_area);
-            frame.render_widget(Paragraph::new(info).block(Block::bordered().border_type(BorderType::Rounded)), info_area);
         })?;
     }
+
     disable_raw_mode()?;
     execute!(stdout(), PopKeyboardEnhancementFlags)?;
     stdout().execute(LeaveAlternateScreen)?;
+
     println!("Selected entries:");
-    DirEntry::entries(&state.root, true)
-        .iter().filter(|x| x.borrow().deleted)
-        .for_each(|entry| println!("{:?}", Path::new(&entry.borrow().path)
-                                                .join(&entry.borrow().name)));
-    Ok(())
+    let path = |x: Entry| Path::new(&x.borrow().path).join(&x.borrow().name);
+    Ok(
+        DirEntry::entries(&state.root, EntryState::Deleted)
+        .into_iter()
+        .map(path)
+        .collect()
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum EntryState {
+    Visible,
+    Deleted,
+    All,
 }
 
 #[derive(Debug, Clone)]
@@ -155,7 +146,7 @@ trait DirEntry {
     fn previous(root: &Self) -> Option<Entry>;
     fn next(root: &Self) -> Option<Entry>;
     fn request_children(root: &Self);
-    fn entries(root: &Self, all_nodes: bool) -> Vec<Entry>;
+    fn entries(root: &Self, all_nodes: EntryState) -> Vec<Entry>;
     fn get(root: &Self, id: &[usize]) -> Option<Entry>;
     fn go(root: &Self, id: &[usize]) -> Option<()>;//just return option so I can do '?', could have returned boolean
     fn detach(root: &Self);
@@ -219,17 +210,27 @@ impl DirEntry for Entry {
         }
         return Some(root);
     }
-    fn entries(root: &Self, all_nodes: bool) -> Vec<Entry> {
+    fn entries(root: &Self, visibiliy: EntryState) -> Vec<Entry> {
         let mut acc = vec![];//not show root.
         if let Some(ref children) = root.borrow().cached_children {
             for ch in children {
-                let open = ch.borrow().open;
-                let visible = !ch.borrow().deleted;
-                if visible || all_nodes {
-                    acc.push(ch.clone());
-                }
-                if all_nodes || (open && visible) {
-                    acc.append(&mut DirEntry::entries(ch, all_nodes));
+                let borrow = ch.borrow();
+                let open = borrow.open;
+                let del = borrow.deleted;
+                match (visibiliy, del) {
+                    (EntryState::Deleted, true) => acc.push(ch.clone()),
+                    (EntryState::Deleted, false) => acc.append(&mut DirEntry::entries(ch, visibiliy)),
+                    (EntryState::All, _) => {
+                        acc.push(ch.clone());
+                        acc.append(&mut DirEntry::entries(ch, visibiliy));
+                    }
+                    (EntryState::Visible, false) => {
+                        acc.push(ch.clone());
+                        if open {
+                            acc.append(&mut DirEntry::entries(ch, visibiliy));
+                        }
+                    }
+                    (EntryState::Visible, true) => (), //avoid this file, is deleted
                 }
             }
         }
@@ -383,11 +384,9 @@ fn go_up(app: &mut State) {
     let Some(current) = DirEntry::get(&app.root, &app.id) else { panic!("ERROR GETTING ID: {:?}", app.id) };
     let next = DirEntry::previous(&current);
     if let Some(next) = next {
-        ////
         if next.borrow().open && app.selecting.is_some() {
             return;
         }
-        ////
         //we are at the top, but we have skipped(at least one), so we show the skipped at the top
         if app.y == 1 && app.skip > 0{
             app.skip -= 1;
@@ -403,11 +402,9 @@ fn go_down(app: &mut State, height: u16) {
 
     let next = DirEntry::next(&current);
     if let Some(next) = next {
-        ////
         if next.borrow().open && app.selecting.is_some() {
             return;
         }
-        ////
         let next = next.borrow().id.clone();
         app.id = next;
         match app.y < height {

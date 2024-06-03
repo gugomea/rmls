@@ -1,3 +1,5 @@
+mod tui;
+pub use tui::tui;
 use std::{fs::{canonicalize, metadata, remove_file, remove_dir_all, File, Metadata, OpenOptions}, io::{self, Read, Seek, SeekFrom, Write}, path::Path, usize};
 use fiemap::{fiemap, FiemapExtent};
 use serde::{Deserialize, Serialize};
