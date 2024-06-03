@@ -1,5 +1,5 @@
 # rmls. (Maybe) recover your files.
-Uses fiemap ioctl with the `fiemap` crate to retrieve the extents(blocks of contiguous blocks of disk memory) of a given file. To achieve this, we save necessary metadata of file before deleting, so that we can retriee it later and (hopefully, if the memory in disk has not been overwritten) recover the file. It's not a replacement of a bin directory, since this really unlinks the file from the OS. Your memory might be corruped in minutes or in days, so try to use it fast :)
+Uses fiemap ioctl with the `fiemap` crate to retrieve the extents(blocks of contiguous blocks of disk memory) of a given file. To achieve this, we save necessary metadata of file before deleting, so that we can retrieve it later and (hopefully, if the memory in disk has not been overwritten) recover the file. It's not a replacement of a bin directory, since this really unlinks the file from the OS. Your memory might be corruped in minutes or in days, so try to use it fast :)
 Since it uses extents, only Ext4 is suported.
 # Features
 
