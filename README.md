@@ -11,6 +11,22 @@ Since it uses extents, only Ext4 is suported.
     * Open directory `space`
     * Select more than one file with `shift + v`
     * Undo last operation with `u`
+To facilitate tree traversal, the directories have unique identifiers following the pattern:
+```
+//.                        [0]           (not visible)
+// ├── Cargo.lock          [0, 0]         => Node { id: [0, 0], name: "Cargo.lock", open: flase, cached_children: None }
+// ├── Cargo.toml          [0, 1]
+// ├── files2.sh           [0, 2]
+// ├── logs.txt            [0, 3]
+// ├── src                 [0, 4]         => Node { id: [0, 4], name: "Cargo.lock", open: true, cached_children: Some([..]) }
+// │   ├── bin             [0, 4, 0]
+// │   │   ├── recover.rs  [0, 4, 0, 1]
+// │   │   ├── rm.rs       [0, 4, 0, 1]
+// │   │   └── tui.rs      [0, 4, 0, 3]
+// │   └── lib.rs          [0, 4, 1]
+// └── T                   [0, 5]
+```
+Heach file has Rc<RefCell<Node>> to the children and a weak reference to the parent. 
 
 ## Demo
 
