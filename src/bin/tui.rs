@@ -17,7 +17,7 @@ pub fn init_panic_hook() {
     let _original_hook = take_hook();
     set_hook(Box::new(move |panic_info| {
         disable_raw_mode().unwrap();
-        stdout().execute(LeaveAlternateScreen).unwrap();
+        //stdout().execute(LeaveAlternateScreen).unwrap();
         println!("{}", panic_info.to_string());
     }));
 }
@@ -63,16 +63,33 @@ fn main() -> io::Result<()> {
                         .fg(Color::Black)
                         .bg(Color::Gray);
                 }
+
+                ////
+                if let Some((ref id_selected, _, _)) = state.selecting {
+                    let id = &state.id;
+                    //selected - current - state.id   || state.id - current - selected
+                    if (id_selected <= &dir.id && &dir.id <= id) || (id_selected >= &dir.id && &dir.id >= id) {
+                        text = Text::raw(format!("{padding}{arrow} {name}"))
+                            .fg(Color::Black)
+                            .bg(Color::Yellow);
+                    }
+                    
+                }
+                ////
+
                 frame.render_widget(text, line_area);
             }
             let info_area = Rect { x: screen.width / 2, y: screen.height / 2, width: screen.width / 2, height: screen.height / 2 };
-            let info = format!("Entries: {}\nCurrent Height: {}\nY: {}\nOffset: {}\nCurrent:{:?}\nDeleted:{:?}", 
+            let info = format!("Entries: {}\nCurrent Height: {}\nY: {}\nOffset: {}\nCurrent:{:?} - {:?}\nDeleted:{:?}\nSelecting:{:?}", 
                 entries.len(),
                 current_height,
                 state.y,
                 state.skip,
                 state.id,
-                state.deletions);
+                DirEntry::get(&state.root, &state.id).unwrap().borrow().name,
+                state.deletions,
+                state.selecting,
+                );
             frame.render_widget(ratatui::widgets::Clear, info_area);
             frame.render_widget(Paragraph::new(info).block(Block::bordered().border_type(BorderType::Rounded)), info_area);
         })?;
@@ -97,7 +114,8 @@ struct State {
     enter: bool,
     root: Entry,
     id: Vec<usize>,
-    deletions: Vec<(Vec<usize>, u16, usize)>,//(id, skip, y)
+    deletions: Vec<(Vec<Vec<usize>>, u16, usize)>,//[ ([id1, id2...],y,skip) ... ]
+    selecting: Option<(Vec<usize>, u16, usize)>,
 }
 
 
@@ -149,7 +167,7 @@ impl DirEntry for Entry {
     //If find deleted directory, then return None;
     fn go(root: &Self, id: &[usize]) -> Option<()> {
         let mut current = root.clone();
-        for &i in &id[1..] {
+        for &i in &id[1..id.len()-1] {
             let curr = current
                 .borrow().cached_children
                 .as_ref()?[i].clone();
@@ -356,34 +374,70 @@ impl State {
             enter: false,
             root, id: vec![0, 0],
             deletions: vec![],
+            selecting: None,
         }
     }
 }
 
 fn go_up(app: &mut State) {
-    //we are at the top, but we have skipped(at least one), so we show the skipped at the top
-    if app.y == 1 && app.skip > 0{
-        app.skip -= 1;
-    } else if app.y != 1 { // just go up.
-        app.y -= 1;
-    }
     let Some(current) = DirEntry::get(&app.root, &app.id) else { panic!("ERROR GETTING ID: {:?}", app.id) };
     let next = DirEntry::previous(&current);
     if let Some(next) = next {
+        ////
+        if next.borrow().open && app.selecting.is_some() {
+            return;
+        }
+        ////
+        //we are at the top, but we have skipped(at least one), so we show the skipped at the top
+        if app.y == 1 && app.skip > 0{
+            app.skip -= 1;
+        } else if app.y != 1 { // just go up.
+            app.y -= 1;
+        }
         app.id = next.borrow().id.clone();
     }
 }
 
 fn go_down(app: &mut State, height: u16) {
     let Some(current) = DirEntry::get(&app.root, &app.id) else { panic!("ERROR GETTING ID: {:?}", app.id) };
+
     let next = DirEntry::next(&current);
     if let Some(next) = next {
+        ////
+        if next.borrow().open && app.selecting.is_some() {
+            return;
+        }
+        ////
         let next = next.borrow().id.clone();
         app.id = next;
         match app.y < height {
             true => app.y += 1,     // we are inside the window, just go down.
             false => app.skip += 1, // we are not, so we skip the upper files(to show the one behind us)
         }
+    }
+}
+
+fn delete(app: &mut State, from: &[usize], to: &[usize]) {
+    let mut id = from;
+    let (mut acc, y, skip) = (vec![], app.y, app.skip);
+    loop {
+            let Some(current) = DirEntry::get(&app.root, id) else {
+                panic!("ERROR GETTING ID: {:?}", app.id)
+            };
+            DirEntry::detach(&current);
+            acc.push(current.borrow().id.clone());
+            if let Some(next) = DirEntry::next(&current) {
+                app.id = next.borrow().id.clone();
+            } else if let Some(_prev) = DirEntry::previous(&current) {
+                go_up(app);// we have to move.
+            } else {
+                panic!("ALL FILES DELETED");
+            }
+            if &current.borrow().id == &to {
+                app.deletions.push((acc, y, skip));
+                break;
+            }
+            id = &app.id;
     }
 }
 
@@ -399,39 +453,58 @@ fn handle_events(app: &mut State, height: u16) -> io::Result<()> {
                     KeyCode::Char('u') => {
                         //If you delete files and then directory, when restoring you will have the
                         //full directory.Maybe keep poping while the id's are already attached.
-                        if let Some((deleted, y, skip)) = app.deletions.pop() {
-                            let del= DirEntry::get(&app.root, &deleted).unwrap();//We know its in the tree
-                            DirEntry::attach(&del);
-                            if DirEntry::go(&app.root, &deleted).is_none() {//impossible
-                                unreachable!("FOUND DELETED DIRECTORY WHILE TRAVERSING");
-                            }
-                            app.id = deleted;
+
+                        if let Some((deletions, y, skip)) = app.deletions.pop() {
+                            app.id = deletions.first().unwrap().clone();
                             app.skip = skip;
                             app.y = y;
+                            for deleted in deletions {
+                                let del= DirEntry::get(&app.root, &deleted).unwrap();//We know its in the tree
+                                DirEntry::attach(&del);
+                                if DirEntry::go(&app.root, &deleted).is_none() {//impossible
+                                    unreachable!("FOUND DELETED DIRECTORY WHILE TRAVERSING");
+                                }
+                            }
                         } else {
                             //print that it is last deletion at bottom or pop up!
                         }
                     }
                     KeyCode::Char('d') => {
+                        let id = &app.id.clone();
+                        match app.selecting.take() {
+                            Some((ref s, y, skip)) => {
+                                if s < &app.id {
+                                    app.skip = skip;
+                                    app.y = y;
+                                    delete(app, s, id);
+                                } else {
+                                    delete(app, id, s);
+                                }
+                            }
+                            None => delete(app, id, id),
+                        }
+                        //panic!("CURRENT: {:?}\nHEIGHT: {}\nY: {}", app.id, height, app.y);
+                    }
+                    KeyCode::Char('V') => {
                         let Some(current) = DirEntry::get(&app.root, &app.id) else {
                             panic!("ERROR GETTING ID: {:?}", app.id)
                         };
-                        app.deletions.push((current.borrow().id.clone(), app.y, app.skip));
-                        DirEntry::detach(&current);
-                        if let Some(next) = DirEntry::next(&current) {
-                            app.id = next.borrow().id.clone();
-                        } else if let Some(prev) = DirEntry::previous(&current) {
-                            go_up(app);// we have to move.
+                        let borrow = current.borrow();
+                        if borrow.open {
+                            panic!("TODO. POP UP: CLOSE DIRECTORY(SPACE)\n{:?}", borrow.id);
                         } else {
-                            panic!("ALL FILES DELETED");
+                            app.selecting = Some((current.borrow().id.clone(), app.y, app.skip));
                         }
                     }
-                    KeyCode::Enter => {
-                        app.enter = !app.enter;
-                        let Some(current) = DirEntry::get(&app.root, &app.id) else { panic!("root: {:?}\nID: {:?}", app.root, app.id) };
-                        if !current.borrow().is_file {
-                            current.borrow_mut().open ^= true; // so that assignment is not that long :)
-                            DirEntry::request_children(&current);
+                    KeyCode::Esc => app.selecting = None,
+                    KeyCode::Char(' ') => {
+                        if app.selecting.is_none() {
+                            app.enter = !app.enter;
+                            let Some(current) = DirEntry::get(&app.root, &app.id) else { panic!("root: {:?}\nID: {:?}", app.root, app.id) };
+                            if !current.borrow().is_file {
+                                current.borrow_mut().open ^= true; // so that assignment is not that long :)
+                                DirEntry::request_children(&current);
+                            }
                         }
                     }
                     _ => {} // avoiding rest of characters
@@ -439,6 +512,10 @@ fn handle_events(app: &mut State, height: u16) -> io::Result<()> {
             }
             Event::Mouse(_) => {}
             _ => {} // avoiding rest of events...
+        }
+        //while the cursor is not on place keep going up.
+        while app.y > height {
+            go_up(app);
         }
     }
     Ok(())
